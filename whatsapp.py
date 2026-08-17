@@ -71,6 +71,26 @@ def ensure_tables():
     try:
         with connection.cursor() as cursor:
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS whatsapp_messages (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    direction ENUM('INBOUND', 'OUTBOUND') NOT NULL,
+                    message_id VARCHAR(255) NULL,
+                    sender VARCHAR(100) NULL,
+                    receiver VARCHAR(100) NULL,
+                    sender_name VARCHAR(255) NULL,
+                    message_type VARCHAR(50) DEFAULT 'text',
+                    message TEXT NULL,
+                    status VARCHAR(50) NULL,
+                    http_status INT NULL,
+                    raw_payload LONGTEXT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_direction (direction),
+                    KEY idx_sender (sender),
+                    KEY idx_receiver (receiver),
+                    KEY idx_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS myads_campaign_sessions (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     phone VARCHAR(30) NOT NULL,
@@ -129,6 +149,37 @@ def normalize_phone(phone: str):
 
 def safe_json_dumps(data):
     return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def find_payload_value(payload, *keys):
+    """Cari field webhook pada payload utama atau wrapper yang umum dipakai."""
+    if not isinstance(payload, dict):
+        return None
+
+    containers = [payload]
+    for wrapper_key in ("data", "payload", "event", "messageData"):
+        wrapped = payload.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            containers.append(wrapped)
+
+    # Beberapa provider membungkus data pesan satu tingkat lebih dalam.
+    for container in list(containers):
+        for wrapper_key in ("data", "payload", "message"):
+            wrapped = container.get(wrapper_key)
+            if isinstance(wrapped, dict) and wrapped not in containers:
+                containers.append(wrapped)
+
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if (
+                value is not None
+                and value != ""
+                and not isinstance(value, (dict, list))
+            ):
+                return value
+
+    return None
 
 
 # =========================================================
@@ -687,6 +738,7 @@ def send_message(data: SendMessageRequest):
 # INBOUND WEBHOOK + MYADS FLOW
 # =========================================================
 
+@app.post("/")
 @app.post("/webhook/mywhatsapp")
 async def inbound_mywhatsapp(request: Request):
     try:
@@ -702,9 +754,14 @@ async def inbound_mywhatsapp(request: Request):
             payload = dict(form)
         else:
             raw_body = await request.body()
-            payload = {
-                "raw": raw_body.decode("utf-8", errors="ignore")
-            }
+            raw_text = raw_body.decode("utf-8", errors="ignore")
+            try:
+                payload = json.loads(raw_text) if raw_text else {}
+            except json.JSONDecodeError:
+                payload = {"raw": raw_text}
+
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
 
         print("\n" + "=" * 80)
         print("INBOUND MYWHATSAPP")
@@ -713,30 +770,51 @@ async def inbound_mywhatsapp(request: Request):
         print("=" * 80)
 
         # Nomor customer yang mengirim pesan
-        customer_phone = payload.get("from")
+        customer_phone = find_payload_value(
+            payload,
+            "from",
+            "from_number",
+            "fromNumber",
+            "phone",
+            "phoneNumber",
+            "remoteJid",
+            "chatId"
+        )
 
         # Nomor WhatsApp kita / device sender
-        whatsapp_number = payload.get("sender")
+        whatsapp_number = find_payload_value(
+            payload,
+            "sender",
+            "sender_number",
+            "senderNumber",
+            "device",
+            "deviceNumber"
+        )
 
-        sender_name = payload.get("pushName")
+        sender_name = find_payload_value(
+            payload, "pushName", "push_name", "senderName", "name"
+        )
 
         message_type = (
-            payload.get("messageType")
-            or payload.get("type")
+            find_payload_value(payload, "messageType", "message_type", "type")
             or "unknown"
         )
 
         message = (
-            payload.get("body")
-            or payload.get("message")
-            or payload.get("text")
+            find_payload_value(
+                payload, "body", "message", "text", "content", "caption"
+            )
         )
 
         message_id = (
-            payload.get("message_id")
-            or payload.get("messageId")
-            or payload.get("id")
+            find_payload_value(payload, "message_id", "messageId", "id")
         )
+
+        # JID WhatsApp lazimnya berbentuk 628xxx@s.whatsapp.net.
+        if customer_phone:
+            customer_phone = str(customer_phone).split("@", 1)[0]
+        if whatsapp_number:
+            whatsapp_number = str(whatsapp_number).split("@", 1)[0]
 
         if customer_phone:
             customer_phone = normalize_phone(str(customer_phone))
@@ -781,7 +859,7 @@ async def inbound_mywhatsapp(request: Request):
             )
 
             return {
-                "success": True,
+                "success": bool(send_result.get("success")),
                 "action": "MYADS_FORM_SENT",
                 "phone": customer_phone,
                 "send_result": send_result
